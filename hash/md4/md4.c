@@ -1,104 +1,172 @@
-#include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 
-#define NUM_ROUNDS 48
+#define ROUNDS 3
+#define STEPS 16
 
-#define WORDS_PER_BLOCK 16
-#define BYTES_PER_BLOCK 64
-#define BYTES_PER_WORDS 4
-#define BUFFER_SIZE 4
-#define START_PADDING 56
+#define BLOCK_BYTES 64 /* Tamaño de bloque: 512 bits. */
+#define BLOCK_WORDS 16 /* 64 bytes / 4 bytes por palabra. */
+#define WORD_BYTES 4   /* Tamaño de la palabra: 32 bits. */
 
-#define F(B, C, D) ((B & C) | ((~B) & D))
-#define G(B, C, D) ((B & C) | (B & D) | (C & D))
-#define H(B, C, D) (B ^ C ^ D)
-#define LEFT_ROT(X, i) ((X) << (i)) | ((X) >> (32 - (i)))
-
-#define BYTE_2_WORD(b) (b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24)
+#define BUFFER_LEN 4 /* Tamaño del buffer: 4 palabras. */
+#define START_LENGTH 56
 
 typedef uint32_t word;
 typedef uint8_t byte;
+typedef word block[BLOCK_WORDS];
+typedef word (*round_function)(word, word, word);
 
-const static word iv[BUFFER_SIZE] = {
+#define ROTL(X, i) ((X) << (i)) | ((X) >> (32 - (i)))
+#define BYTE_2_WORD(b) ((b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24))
+
+static const word IV[BUFFER_LEN] = {
     0x67452301,  // Word A.
     0xEFCDAB89,  // Word B.
     0x98BADCFE,  // Word C.
     0x10325476,  // Word D.
 };
 
-const static size_t g[NUM_ROUNDS] = {
-    0, 1, 2, 3,  4, 5,  6, 7,  8, 9, 10, 11, 12, 13, 14, 15,
-    0, 4, 8, 12, 1, 5,  9, 13, 2, 6, 10, 14, 3,  7,  11, 15,
-    0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5,  13, 3,  11, 7,  15,
+static const word K[ROUNDS] = {
+    0x00000000,  // K_1.
+    0x5A827999,  // K_2.
+    0x6ED9EBA1,  // K_3.
 };
 
-const static size_t s[NUM_ROUNDS] = {
-    3, 7, 11, 19, 3, 7, 11, 19, 3, 7, 11, 19, 3, 7, 11, 19,
-    3, 5, 9,  13, 3, 5, 9,  13, 3, 5, 9,  13, 3, 5, 9,  13,
-    3, 9, 11, 15, 3, 9, 11, 15, 3, 9, 11, 15, 3, 9, 11, 15,
+// F functions.
+static word f_func(word B, word C, word D) {return ((B & C) | ((~B) & D));}
+static word g_func(word B, word C, word D) {return ((B & C) | (B & D) | (C & D));}
+static word h_func(word B, word C, word D) {return (B ^ C ^ D);}
+static const round_function F[ROUNDS] = {
+    f_func,
+    g_func,
+    h_func,
 };
 
-/**
- * @brief Performs the MD4 compression function on a 512-bit block.
- *
- * Processes the 48 operations of the three MD4 rounds and updates the
- * internal state consisting of four 32-bit words.
- *
- * @param block 512-bit message block represented as 16 32-bit words
- *              in little-endian format.
- * @param buffer MD4 internal state consisting of four 32-bit words.
- */
+static const size_t G_WORD[ROUNDS][STEPS] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15},
+    {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15},
+};
+
+static const size_t S_SHIFT[ROUNDS][STEPS] = {
+    {3, 7, 11, 19, 3, 7, 11, 19, 3, 7, 11, 19, 3, 7, 11, 19},
+    {3, 5, 9, 13, 3, 5, 9, 13, 3, 5, 9, 13, 3, 5, 9, 13},
+    {3, 9, 11, 15, 3, 9, 11, 15, 3, 9, 11, 15, 3, 9, 11, 15},
+};
+
 void md4_compression(word* block, word* buffer);
 
-/**
- * @brief Adds the MD4 padding and message length and processes the final block.
- *
- * Builds the final block or blocks required by the MD4 specification by
- * appending the padding bit, the required zero bits, and the original
- * message length in bits as a 64-bit little-endian value.
- *
- * @param message Pointer to the beginning of the remaining message data after
- *                all complete blocks have been processed.
- * @param length Total length of the original message in bytes.
- * @param buffer MD4 internal state, which is updated with the final block(s).
- */
-void md4_padding(byte* message, size_t length, word* buffer);
+int md4(const byte* message, uint64_t length, byte* digest) {
+    block* message_in_blocks = NULL;  // El mensaje formateado en bloques.
+    word* current_block = NULL;       // Apunta al bloque que se esta procesando.
+    const byte* tail = message;       // Apunta al byte del mensaje que se esta procesando.
 
-/**
- * @brief Finalizes the MD4 computation and generates the resulting digest.
- *
- * Allocates memory for the 16-byte MD4 digest and copies the final internal
- * state into it in little-endian format.
- *
- * @param buffer Final MD4 internal state consisting of four 32-bit words.
- * @param output Pointer where the address of the generated digest is stored.
- *               The caller is responsible for freeing the allocated memory.
- */
-void md4_finalization(word* buffer, byte** output);
+    size_t num_blocks = (length / BLOCK_BYTES) + 1;
+    /* Mín. nº de bloques para alojar el mensaje. Si length % BLOCK_BYTES fuera
+    0 no seria necesario el + 1 para alojar el contenido del mensaje, pero
+    seguiría siendo necesario para el padding.*/
 
-byte* md4(byte* message, size_t length) {
-    word block[WORDS_PER_BLOCK];
-    word buffer[BUFFER_SIZE] = {iv[0], iv[1], iv[2], iv[3]};
-    byte* output = NULL;
+    size_t full_blocks = length / BLOCK_BYTES;        // Número de bloques completos.
+    size_t last_block_length = length % BLOCK_BYTES;  // Tamaño del último bloque en bytes.
+    uint64_t length_b = (uint64_t) length << 3;       // Tamaño del mensaje en bits para el
+                                                      // padding (X << 3 equivale a X * 8).
 
-    // Process full blocks.
-    size_t final_block = length / BYTES_PER_BLOCK;
-    for (size_t block_i = 0; block_i < final_block; block_i++) {
-        // Load block.
-        for (size_t word_i = 0, offset; word_i < WORDS_PER_BLOCK; word_i++) {
-            offset = block_i * BYTES_PER_BLOCK + word_i * BYTES_PER_WORDS;
-            block[word_i] = BYTE_2_WORD((message + offset));
-        }
+    word buffer[BUFFER_LEN] = {IV[0], IV[1], IV[2], IV[3]};
 
-        md4_compression(block, buffer);
+    if (last_block_length >= START_LENGTH) {
+        // Si el padding no cabe en el espacio del último bloque, se añade otro bloque.
+        num_blocks++;
     }
 
-    md4_padding((message + (final_block * BYTES_PER_BLOCK)), length, buffer);
-    md4_finalization(buffer, &output);
+    message_in_blocks = (block*)calloc(num_blocks, sizeof(block));
+    if (message_in_blocks == NULL) {
+        return -1;
+    }
 
-    return output;
+    // Se cargan los bloques completos.
+    for (size_t block_i = 0; block_i < full_blocks; block_i++) {
+        current_block = message_in_blocks[block_i];
+
+        // Se carga cada palabra del bloque que se esta procesando.
+        for (size_t word_i = 0; word_i < BLOCK_WORDS; word_i++) {
+            current_block[word_i] = BYTE_2_WORD(tail);
+
+            // Cada vez que se procesa una palabras, se desplaza el puntero.
+            tail += WORD_BYTES;
+        }
+    }
+
+    // Se cargan los bloques finales.
+    if (last_block_length == 0) {
+        // Si es 0 significa que el tamaño del mensaje es múltiplo del tamaño de bloque, por lo que
+        // ya no hay mensaje y solo queda añadir el padding.
+
+        current_block = message_in_blocks[num_blocks - 1];
+
+        // Se pone el bit 1 al principio.
+        current_block[0] = 0X00000080;
+        // Se pone el tamaño del mensaje original al final.
+        current_block[BLOCK_WORDS - 2] = length_b;
+        current_block[BLOCK_WORDS - 1] = length_b >> 32;
+
+    } else if (last_block_length < START_LENGTH) {
+        // Significa que lo que falta de procesar del mensaje cabe en un bloque junto al padding.
+
+        current_block = message_in_blocks[num_blocks - 1];
+
+        // Se procesa lo que quede el mensaje.
+        for (size_t byte_i = 0; byte_i < last_block_length; byte_i++) {
+            current_block[byte_i / 4] |= (word)(*tail) << (8 * (byte_i % 4));
+
+            // Cada vez que se procesa una byte, se desplaza el puntero.
+            tail++;
+        }
+
+        // Se concatena el bit bit 1.
+        current_block[last_block_length / 4] |= 0x80 << (8 * (last_block_length % 4));
+        // Se pone el tamaño del mensaje original al final.
+        current_block[BLOCK_WORDS - 2] = length_b;
+        current_block[BLOCK_WORDS - 1] = length_b >> 32;
+
+    } else {
+        // Significa que lo que falta de procesar del mensaje no cabe en un bloque junto al
+        // padding por lo que el padding se dividirá en 2 bloques.
+
+        // El primer bloque tendrá lo que falta de mensaje, el bit 1 y 0s.
+        current_block = message_in_blocks[num_blocks - 2];
+
+        // Se procesa lo que quede el mensaje.
+        for (size_t byte_i = 0; byte_i < last_block_length; byte_i++) {
+            current_block[byte_i / 4] |= (word)(*tail) << (8 * (byte_i % 4));
+
+            // Cada vez que se procesa una byte, se desplaza el puntero.
+            tail++;
+        }
+
+        // Se concatena el bit bit 1.
+        current_block[last_block_length / 4] |= 0x80 << (8 * (last_block_length % 4));
+
+        // El segundo bloque esta vacío, salvo por el tamaño del mensaje original.
+        current_block = message_in_blocks[num_blocks - 1];
+        current_block[BLOCK_WORDS - 2] = length_b;
+        current_block[BLOCK_WORDS - 1] = length_b >> 32;
+    }
+
+    // Se comprimen los bloques.
+    for (size_t i = 0; i < num_blocks; i++) {
+        md4_compression(message_in_blocks[i], buffer);
+    }
+
+    // Se convierte el buffer en el digest.
+    for (size_t i = 0; i < BUFFER_LEN; i++) {
+        digest[i * WORD_BYTES] = (byte)(buffer[i]);
+        digest[i * WORD_BYTES + 1] = (byte)(buffer[i] >> 8);
+        digest[i * WORD_BYTES + 2] = (byte)(buffer[i] >> 16);
+        digest[i * WORD_BYTES + 3] = (byte)(buffer[i] >> 24);
+    }
+    free(message_in_blocks);
+    
+    return 0;
 }
 
 void md4_compression(word* block, word* buffer) {
@@ -107,98 +175,30 @@ void md4_compression(word* block, word* buffer) {
     word C = buffer[2];
     word D = buffer[3];
 
+    word aux = 0x00000000;
     word Kt = 0x00000000;
-    word Ft = 0x00000000;
-    word Mg = 0x00000000;
-    size_t Si = 0;
+    word (*Ft)(word, word, word);
+    size_t g_i = 0;
+    size_t s_i = 0;
 
-    for (size_t i = 0; i < NUM_ROUNDS; i++) {
-        if (i < 16) {
-            Kt = 0x00000000;
-            Ft = F(B, C, D);
-        } else if (i < 32) {
-            Kt = 0x5A827999;
-            Ft = G(B, C, D);
-        } else {
-            Kt = 0x6ED9EBA1;
-            Ft = H(B, C, D);
+    for (size_t t = 0; t < ROUNDS; t++) {
+        Kt = K[t];
+        Ft = F[t];
+
+        for (size_t i = 0; i < STEPS; i++) {
+            g_i = G_WORD[t][i];
+            s_i = S_SHIFT[t][i];
+
+            aux = ROTL(A + Ft(B, C, D) + block[g_i] + Kt, s_i);
+            A = D;
+            D = C;
+            C = B;
+            B = aux;
         }
-        Mg = block[g[i]];
-        Si = s[i];
-
-        Ft = A + Ft + Mg + Kt;
-        Ft = LEFT_ROT(Ft, Si);
-
-        A = D;
-        D = C;
-        C = B;
-        B = Ft;
     }
 
     buffer[0] += A;
     buffer[1] += B;
     buffer[2] += C;
     buffer[3] += D;
-}
-
-void md4_padding(byte* message, size_t length, word* buffer) {
-    word block[WORDS_PER_BLOCK];
-    uint64_t size = length << 3;
-    size_t block_size = length % BYTES_PER_BLOCK;
-    size_t i;
-
-    for (i = 0; i < WORDS_PER_BLOCK; i++) {
-        block[i] = 0x00000000;
-    }
-
-    if (block_size == 0) {
-        // There is no block. The message size matches the block size.
-        block[0] = 0X00000080;
-        block[WORDS_PER_BLOCK - 2] = size;
-        block[WORDS_PER_BLOCK - 1] = size >> 32;
-        md4_compression(block, buffer);
-
-    } else if (block_size < START_PADDING) {
-        // Block with space for padding.
-
-        for (i = 0; i < block_size; i++) {
-            block[i / 4] += message[i] << (8 * (i % 4));
-        }
-        block[i / 4] += 0x80 << (8 * (i % 4));
-
-        block[WORDS_PER_BLOCK - 2] = size;
-        block[WORDS_PER_BLOCK - 1] = size >> 32;
-        md4_compression(block, buffer);
-
-    } else {
-        // Block with no space for padding. A block is added to provide space
-        // for it.
-        for (i = 0; i < block_size; i++) {
-            block[i / 4] += message[i] << (8 * (i % 4));
-        }
-        block[i / 4] += 0x80 << (8 * (i % 4));
-        md4_compression(block, buffer);
-
-        for (i = 0; i < WORDS_PER_BLOCK; i++) {
-            block[i] = 0x00000000;
-        }
-
-        block[WORDS_PER_BLOCK - 2] = size;
-        block[WORDS_PER_BLOCK - 1] = size >> 32;
-        md4_compression(block, buffer);
-    }
-}
-
-void md4_finalization(word* buffer, byte** output) {
-    *output = (byte*)malloc(BUFFER_SIZE * BYTES_PER_WORDS);
-    if (*output == NULL) {
-        return;
-    };
-
-    for (size_t i = 0; i < BUFFER_SIZE; i++) {
-        (*output)[i * BYTES_PER_WORDS] = (byte)(buffer[i]);
-        (*output)[i * BYTES_PER_WORDS + 1] = (byte)(buffer[i] >> 8);
-        (*output)[i * BYTES_PER_WORDS + 2] = (byte)(buffer[i] >> 16);
-        (*output)[i * BYTES_PER_WORDS + 3] = (byte)(buffer[i] >> 24);
-    }
 }
